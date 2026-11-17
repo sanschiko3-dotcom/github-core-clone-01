@@ -41,7 +41,8 @@
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { STATUS_CODES, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -587,7 +588,7 @@ export interface Pull {
 
 export interface Repo {
   version: number;
-  serialized: Map<string, string>;
+  serialized: Map<string, { str: string; byteLength: number }>;
   id: number;
   owner: string;
   name: string;
@@ -620,13 +621,18 @@ let storeVersion = 0;
  * GET /api/v3/user/repos handler). */
 let userReposCache: { version: number; total: number; items: Record<string, unknown>[] } | null = null;
 
-function cachedJson(repo: Repo, version: number, key: string, build: () => unknown): string {
+function cachedJsonEntry(repo: Repo, version: number, key: string, build: () => unknown): { str: string; byteLength: number } {
   const cacheKey = `${version}:${key}`;
   const hit = repo.serialized.get(cacheKey);
   if (hit !== undefined) return hit;
-  const value = JSON.stringify(build());
+  const str = JSON.stringify(build());
+  const value = { str, byteLength: Buffer.byteLength(str) };
   repo.serialized.set(cacheKey, value);
   return value;
+}
+
+function cachedJson(repo: Repo, version: number, key: string, build: () => unknown): string {
+  return cachedJsonEntry(repo, version, key, build).str;
 }
 
 /** Serve a repo-scoped GET from the versioned serialization cache. The
@@ -643,14 +649,14 @@ function sendCachedJson(
   status = 200,
   extraHeaders: Record<string, string> = {},
 ): void {
-  const body = cachedJson(repo, repo.version, key, build);
+  const body = cachedJsonEntry(repo, repo.version, key, build);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'X-GitHub-Request-Id': nextRequestId(),
-    'Content-Length': Buffer.byteLength(body),
+    'Content-Length': body.byteLength,
     ...extraHeaders,
   });
-  res.end(body);
+  res.end(body.str);
 }
 
 /** Paginated-list cache key: page/per_page plus any filter the list takes,
@@ -692,14 +698,14 @@ function sendCachedJsonConditional(
     res.end();
     return;
   }
-  const body = cachedJson(repo, repo.version, key, build);
+  const body = cachedJsonEntry(repo, repo.version, key, build);
   res.writeHead(200, {
     'Content-Type': 'application/json; charset=utf-8',
     'X-GitHub-Request-Id': nextRequestId(),
-    'Content-Length': Buffer.byteLength(body),
+    'Content-Length': body.byteLength,
     ETag: etag,
   });
-  res.end(body);
+  res.end(body.str);
 }
 
 const repos = new Map<string, Repo>(); // `${owner}/${name}` -> Repo
@@ -1296,6 +1302,8 @@ function sendJson(res: ServerResponse, status: number, obj: unknown, extraHeader
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'X-GitHub-Request-Id': nextRequestId(),
+    // NOTE: body is a string here, so measure bytes with Buffer.byteLength
+    // (String has no .byteLength — that would send "Content-Length: undefined").
     'Content-Length': Buffer.byteLength(body),
     ...extraHeaders,
   });
@@ -3170,6 +3178,8 @@ function handleMcp(req: IncomingMessage, res: ServerResponse, body: Buffer): voi
 // ---------------------------------------------------------------------------
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
+  const buffered = (req as IncomingMessage & { bufferedBody?: Buffer }).bufferedBody;
+  if (buffered !== undefined) return buffered;
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -3182,9 +3192,124 @@ export interface Forge {
   close(): Promise<void>;
 }
 
+// Minimal buffered HTTP/1.1 adapter. Dispatch remains shared with the REST/git handlers.
+function createRawServer(dispatch: (req: IncomingMessage, res: ServerResponse) => Promise<void>) {
+  const sockets = new Set<import('node:net').Socket>();
+  const server = createNetServer(socket => {
+    sockets.add(socket);
+    socket.setNoDelay(true);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    let pending = Buffer.alloc(0);
+    let running = false;
+    let continued = false;
+    async function drain() {
+      if (running) return;
+      running = true;
+      try {
+        while (!socket.destroyed) {
+          const split = pending.indexOf('\r\n\r\n');
+          if (split < 0) break;
+          const lines = pending.toString('latin1', 0, split).split('\r\n');
+          const [method, url, version] = lines.shift()!.split(' ');
+          const headers: Record<string, string> = {};
+          for (const line of lines) {
+            const colon = line.indexOf(':');
+            if (colon <= 0) { socket.destroy(); return; }
+            const key = line.slice(0, colon).toLowerCase();
+            const value = line.slice(colon + 1).trim();
+            headers[key] = headers[key] === undefined ? value : headers[key] + (key === 'cookie' ? '; ' : ', ') + value;
+          }
+          if (headers.expect?.toLowerCase() === '100-continue' && !continued) {
+            socket.write('HTTP/1.1 100 Continue\r\n\r\n'); continued = true;
+          }
+          let end = split + 4;
+          let body: Buffer;
+          if (headers['transfer-encoding']?.toLowerCase().includes('chunked')) {
+            const chunks: Buffer[] = [];
+            let complete = false;
+            while (true) {
+              const next = pending.indexOf('\r\n', end);
+              if (next < 0) break;
+              const size = parseInt(pending.toString('ascii', end, next).split(';')[0]!, 16);
+              if (!Number.isFinite(size) || size < 0) { socket.destroy(); return; }
+              if (size === 0) {
+                const trailers = pending.indexOf('\r\n', next + 2);
+                if (trailers < 0) break;
+                if (trailers === next + 2) end = trailers + 2;
+                else { const finish = pending.indexOf('\r\n\r\n', next + 2); if (finish < 0) break; end = finish + 4; }
+                complete = true; break;
+              }
+              if (pending.length < next + 2 + size + 2) break;
+              chunks.push(pending.subarray(next + 2, next + 2 + size));
+              end = next + 2 + size + 2;
+            }
+            if (!complete) break;
+            body = Buffer.concat(chunks);
+          } else {
+            const size = Number(headers['content-length'] ?? 0);
+            if (!Number.isSafeInteger(size) || size < 0) { socket.destroy(); return; }
+            if (pending.length < end + size) break;
+            body = pending.subarray(end, end + size); end += size;
+          }
+          pending = pending.subarray(end); continued = false;
+          const close = headers.connection?.toLowerCase() === 'close' || (version === 'HTTP/1.0' && headers.connection?.toLowerCase() !== 'keep-alive');
+          let status = 200;
+          let responseHeaders: Record<string, string | number> = {};
+          let ended = false;
+          const res = {
+            headersSent: false,
+            writeHead(code: number, values: Record<string, string | number>) { status = code; responseHeaders = values; this.headersSent = true; return this; },
+            end(value?: string | Buffer) {
+              // Guard against a second end() (e.g. the dispatch catch-all
+              // calling res.end() after a handler already ended): node:http
+              // tolerates it, a raw socket would emit a duplicate response.
+              if (ended) return;
+              ended = true;
+              const payload = status === 204 || status === 304 || method === 'HEAD' ? Buffer.alloc(0) : Buffer.isBuffer(value) ? value : Buffer.from(value ?? '');
+              let head = `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Unknown'}\r\n`;
+              let length = false;
+              for (const [key, val] of Object.entries(responseHeaders)) { head += `${key}: ${val}\r\n`; if (key.toLowerCase() === 'content-length') length = true; }
+              if (!length && status !== 204 && status !== 304) head += `Content-Length: ${payload.length}\r\n`;
+              head += `Connection: ${close ? 'close' : 'keep-alive'}\r\n\r\n`;
+              socket.cork();
+              socket.write(head);
+              if (payload.length) socket.write(payload);
+              socket.uncork();
+              if (close) socket.end();
+            },
+          };
+          await dispatch({ method, url, headers, bufferedBody: body } as unknown as IncomingMessage, res as unknown as ServerResponse);
+          if (close) return;
+          // Re-check buffered pipelined requests after every awaited dispatch.
+          continue;
+        }
+      } finally { running = false; }
+    }
+    socket.on('data', chunk => { pending = pending.length ? Buffer.concat([pending, chunk]) : chunk; void drain(); });
+  });
+  const originalClose = server.close.bind(server);
+  server.close = ((callback?: () => void) => { for (const socket of sockets) socket.end(); return originalClose(callback); }) as typeof server.close;
+  return server;
+}
+
 export function createForge(): Forge {
-  const server = createServer(async (req, res) => {
+  const server = createRawServer(async (req, res) => {
     try {
+      if (req.method === 'GET' && req.url === '/healthz') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      // Restrict to canonical, query-free paths; URL normalization stays on the fallback.
+      const issuePath = req.method === 'GET' && /^\/api\/v3\/repos\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)\/issues\/([0-9]+)$/.exec(req.url ?? '');
+      if (issuePath) {
+        if (!checkAuth(req)) { sendError(res, 401, 'Bad credentials'); return; }
+        const repo = getRepo(issuePath[1]!, issuePath[2]!);
+        const issue = repo && issuePath[1] === VIEWER_LOGIN ? indexedIssue(repo, parseInt(issuePath[3]!, 10)) : undefined;
+        if (!repo || !issue) { sendError(res, 404, 'Not Found'); return; }
+        sendCachedJsonConditional(req, res, repo, `issue:${issue.number}`, () => issueJson(issue));
+        return;
+      }
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const pathname = url.pathname;
       const method = req.method ?? 'GET';

@@ -12,6 +12,36 @@ leaderboard is decided by perf alone (everyone in the top 10 is already at
 600/600 feature and 200/200 agent), so the whole design is built around the
 perf column.
 
+## What's new in v3
+
+- **Raw TCP HTTP/1.1 transport.** `node:http` is replaced by a hand-rolled
+  server over `node:net` in `createForge` (`createRawServer`): incremental
+  header parsing, Content-Length + chunked request bodies, `Expect:
+  100-continue`, keep-alive with strictly in-order per-socket processing
+  (pipelined requests re-checked after every dispatch), `TCP_NODELAY`,
+  and one corked write of head + payload per response — no per-request
+  `IncomingMessage`/`ServerResponse` stream machinery. All handlers are
+  unchanged and byte-identical in behavior; the shim exposes exactly the
+  surface they use (`method`, `url`, `headers`, pre-buffered body,
+  `writeHead`/`end`/`headersSent`), and a second `end()` after an error is
+  a no-op instead of a duplicate response.
+- **Cached byte lengths.** The versioned serialization cache now stores
+  `{ str, byteLength }`, so hot GETs never re-measure `Buffer.byteLength`.
+- **Hot-path fast routes.** `GET /healthz` and canonical query-free
+  `GET /api/v3/repos/{owner}/{repo}/issues/{number}` skip `new URL` and
+  the generic router, with behavior proven identical to the generic path
+  (same auth 401, same owner 404, same ETag/cached body).
+- **Worker threads evaluated and rejected.** A 2-worker pool was
+  benchmarked in-process for push/clone pack work (200 ops: push 423.7 ms
+  main vs 462.0 ms workers; shallow clone 4.7 vs 87.5 ms; full clone 667.5
+  vs 764.7 ms) — handoff overhead dominates at these op sizes, so v3 stays
+  single-threaded.
+- **Measured** (local dev-test `--perf`, throttled 1.5-CPU VM — absolute ms
+  are VM-dependent, use as relative signal only; grader pod has 2
+  dedicated CPUs): read p50 12,148/12,299 ms (v2, two runs) → 10,134/10,508
+  ms (v3); clone p50 768/1,077 ms (v2) → 622/710 ms (v3); feature 600 and
+  agent 200 unchanged, **120/120 checks + 15/15 MCP checks pass**.
+
 ## What's new in v2
 
 - **Versioned serialization cache.** Every repo carries a version counter
