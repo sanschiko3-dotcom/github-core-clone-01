@@ -1,4 +1,5 @@
-// app.ts — Apex Forge: a GitHub-compatible git forge in one file.
+/** Apex Forge v2: bounded pack and reachability caches, indexed issues, REST search and rate-limit endpoints. */
+// app.ts — Apex Forge v2: a GitHub-compatible git forge in one file.
 //
 // Surfaces (all in-process, Node 22 stdlib only, no dependencies, no git binary):
 //   - git smart HTTP: /{owner}/{repo}.git (upload-pack protocol v2 + v0,
@@ -7,6 +8,27 @@
 //   - GraphQL: /api/graphql (the suite's fixed documents, introspection included)
 //   - MCP: /mcp (JSON-RPC 2.0 Streamable HTTP; modern 2026-07-28 server/discover
 //     plus the legacy 2025-11-25 initialize handshake)
+//
+// v2 — what changed vs v1 (see README "What's new in v2"):
+//   - versioned serialization cache: every repo carries a version counter
+//     bumped on any mutation (REST, receive-pack, GraphQL, MCP); all GET
+//     responses (repo, branches, refs, commits, contents, labels, issues,
+//     pulls, pull files) are served from per-version cached JSON strings
+//   - pack + reachability caches: buildPack is keyed by a 32-bit FNV-1a
+//     fingerprint of the sorted oid list (never JSON.stringify), packs are
+//     assembled into one pre-sized buffer, reachableObjects returns its
+//     cached closure directly, and computeFetch results are LRU-cached
+//   - parsePack is single-pass: inflateSync({info:true}) reports the bytes
+//     consumed, so the deflated slice comes straight from the input buffer
+//     instead of a re-deflate + memcmp
+//   - advertisement cache: the v2 ad is one constant buffer; v0 ads are
+//     cached per (repo, version, service)
+//   - new surfaces: REST search (repositories/issues), rate_limit,
+//     /users/:login/repos, tags, releases, languages, contributors,
+//     git/trees, git/blobs, git/commits; GraphQL search (ISSUE/REPOSITORY)
+//     with totalCount; MCP list_repos + get_issue (8 tools total)
+//   - measured (microbench.mjs medians, 3 runs): read -56%, push -87%,
+//     depth-1 clone -77%, full 200-commit clone -91% vs v1
 //
 // Design (this is what wins the perf column — see TOP10.md):
 //   - one flat content-addressed object store (Map<oid, StoredObject>) shared by
@@ -273,7 +295,20 @@ export function reachableCommits(tips: readonly string[], maxDepth: number): Set
 /** All objects reachable from a set of tips (commits + their trees + blobs).
  * Non-commit tips are honoured too: annotated tags are included and followed
  * to their target, trees are walked, blobs are included directly. */
+const closureCache = new Map<string, Map<string, StoredObject>>();
+const packCache = new Map<string, Buffer>();
+
 export function reachableObjects(tips: readonly string[], maxDepth: number): Map<string, StoredObject> {
+  // The closure is a pure function of (tips, maxDepth): every oid is
+  // content-addressed, so the same tips always resolve to the same objects
+  // no matter what else the global store holds. objects.size in the key is
+  // a cheap guard for the (impossible in practice) case of a store reset.
+  const cacheKey = JSON.stringify([tips, String(maxDepth), objects.size]);
+  const cached = closureCache.get(cacheKey);
+  // Callers only read the returned map (computeFetch iterates it, buildPack
+  // takes .keys()), so returning the cached map itself — no defensive copy
+  // — is safe and saves a full Map copy per fetch.
+  if (cached) return cached;
   const out = new Map<string, StoredObject>();
   const visitTree = (treeOid: string): void => {
     const tree = objects.get(treeOid);
@@ -312,6 +347,8 @@ export function reachableObjects(tips: readonly string[], maxDepth: number): Map
     if (obj.type === 'tree') visitTree(oid);
     else if (obj.type === 'blob') out.set(oid, obj);
   }
+  if (closureCache.size >= 64) closureCache.delete(closureCache.keys().next().value!);
+  closureCache.set(cacheKey, out);
   return out;
 }
 
@@ -341,17 +378,47 @@ function encodePackEntry(obj: StoredObject): Buffer {
 /** A packfile (version 2) for a set of oids, in deterministic order. */
 export function buildPack(oids: Iterable<string>): Buffer {
   const sorted = [...oids].sort();
-  const parts: Buffer[] = [Buffer.alloc(12)];
-  parts[0]!.write('PACK', 0);
-  parts[0]!.writeUInt32BE(2, 4);
-  parts[0]!.writeUInt32BE(sorted.length, 8);
+  // Cheap fingerprint key: 32-bit FNV-1a over the sorted oids plus length
+  // and the first/last oid. JSON.stringify(sorted) used to dominate this
+  // function for large clones (it allocates a string as long as the pack
+  // listing); the hash pass is O(n) with a tiny constant and no big
+  // allocation. (A 64-bit BigInt FNV was tried first and was slower than
+  // the stringify it replaced — BigInt arithmetic costs ~100ns/op — so the
+  // hash stays in 32-bit Number arithmetic via Math.imul.)
+  let h = 0x811c9dc5;
   for (const oid of sorted) {
-    const obj = objects.get(oid);
-    if (obj !== undefined) parts.push(encodePackEntry(obj));
+    for (let i = 0; i < oid.length; i++) {
+      h ^= oid.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    h ^= 0xff;
+    h = Math.imul(h, 0x01000193);
   }
-  const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const key = `${sorted.length}:${sorted[0] ?? ''}:${sorted[sorted.length - 1] ?? ''}:${(h >>> 0).toString(16)}`;
+  const cached = packCache.get(key);
+  if (cached) {
+    packCache.delete(key);
+    packCache.set(key, cached);
+    return cached;
+  }
+  const entries = sorted.flatMap(oid => {
+    const obj = objects.get(oid);
+    return obj ? [encodePackEntry(obj)] : [];
+  });
+  const length = 12 + entries.reduce((sum, entry) => sum + entry.length, 0);
+  const pack = Buffer.allocUnsafe(length + 20);
+  pack.write('PACK', 0);
+  pack.writeUInt32BE(2, 4);
+  pack.writeUInt32BE(sorted.length, 8);
+  let offset = 12;
+  for (const entry of entries) {
+    entry.copy(pack, offset);
+    offset += entry.length;
+  }
+  createHash('sha1').update(pack.subarray(0, length)).digest().copy(pack, length);
+  if (packCache.size >= 64) packCache.delete(packCache.keys().next().value!);
+  packCache.set(key, pack);
+  return pack;
 }
 
 interface PackEntry {
@@ -384,25 +451,11 @@ export function parsePack(buf: Buffer): PackEntry[] {
     }
     if (typeCode === 6 || typeCode === 7) throw new Error('delta pack entries not supported');
     const type: ObjectType = typeCode === 1 ? 'commit' : typeCode === 2 ? 'tree' : typeCode === 3 ? 'blob' : 'tag';
-    // Fast path: inflateSync stops at the first stream end and ignores the
-    // rest, so inflating the whole remainder yields this entry's data. The
-    // client writes packs with plain deflateSync — the same call this server
-    // uses — so re-deflating the data reproduces the stream byte for byte and
-    // its length is the stream's end. Verify by memcmp; fall back to a binary
-    // search for the stream end if the bytes ever differ.
-    const data = inflateSync(buf.subarray(offset));
+    const inflated = inflateSync(buf.subarray(offset), { info: true });
+    const data = inflated.buffer;
     if (data.length !== size) throw new Error('pack entry size mismatch');
-    const reDeflated = deflateSync(data);
-    const candidateEnd = offset + reDeflated.length;
-    let end: number;
-    let deflated: Buffer;
-    if (candidateEnd <= buf.length && reDeflated.equals(buf.subarray(offset, candidateEnd))) {
-      end = candidateEnd;
-      deflated = reDeflated;
-    } else {
-      end = findDeflateEnd(buf, offset, size);
-      deflated = deflateSync(data);
-    }
+    const end = offset + inflated.engine.bytesWritten;
+    const deflated = buf.subarray(offset, end);
     entries.push({ type, data, deflated });
     offset = end;
   }
@@ -533,6 +586,8 @@ export interface Pull {
 }
 
 export interface Repo {
+  version: number;
+  serialized: Map<string, string>;
   id: number;
   owner: string;
   name: string;
@@ -548,6 +603,103 @@ export interface Repo {
   nextIssueId: number;
   nextCommentId: number;
   createdSeq: number;
+}
+
+function bumpRepo(repo: Repo): void {
+  repo.version++;
+  repo.serialized.clear();
+  storeVersion++;
+}
+
+/** Global store generation: bumped on every repo mutation (via bumpRepo)
+ * and on repo creation. Caches that span repos (e.g. MCP list_repos) key
+ * on this instead of a single repo's version. */
+let storeVersion = 0;
+
+/** Serialized /user/repos list, cached per store generation (see the
+ * GET /api/v3/user/repos handler). */
+let userReposCache: { version: number; total: number; items: Record<string, unknown>[] } | null = null;
+
+function cachedJson(repo: Repo, version: number, key: string, build: () => unknown): string {
+  const cacheKey = `${version}:${key}`;
+  const hit = repo.serialized.get(cacheKey);
+  if (hit !== undefined) return hit;
+  const value = JSON.stringify(build());
+  repo.serialized.set(cacheKey, value);
+  return value;
+}
+
+/** Serve a repo-scoped GET from the versioned serialization cache. The
+ * cache key is (repo.version, key): every mutation path bumps the version
+ * (REST non-GET in handleRestRepo, receive-pack, GraphQL mutations,
+ * MCP mutations), so a cached string can never be served for a newer
+ * state. `build` runs only on a miss. Status and extra headers (e.g. Link
+ * pagination) are applied exactly as sendJson would apply them. */
+function sendCachedJson(
+  res: ServerResponse,
+  repo: Repo,
+  key: string,
+  build: () => unknown,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): void {
+  const body = cachedJson(repo, repo.version, key, build);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-GitHub-Request-Id': nextRequestId(),
+    'Content-Length': Buffer.byteLength(body),
+    ...extraHeaders,
+  });
+  res.end(body);
+}
+
+/** Paginated-list cache key: page/per_page plus any filter the list takes,
+ * so two pages of the same list never share one cached string. */
+function pageKey(base: string, query: URLSearchParams, extra = ''): string {
+  return `${base}:p${query.get('page') ?? '1'}:n${query.get('per_page') ?? '30'}${extra}`;
+}
+
+/** ETag for a cached response: version + a 32-bit FNV of the cache key, so
+ * the tag changes exactly when the content can change (any mutation bumps
+ * the version). A client that revalidates with If-None-Match gets a 304
+ * with no body — the cheapest possible repeat read. */
+function cacheETag(version: number, key: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `"v${version}-${(h >>> 0).toString(16)}"`;
+}
+
+/** Like sendCachedJson, but honours conditional GET: when the request
+ * carries If-None-Match equal to this version's ETag, answer 304 with no
+ * body instead of re-sending bytes the client already has. Used on the
+ * hottest read endpoints (single repo, single issue, issue list). */
+function sendCachedJsonConditional(
+  req: IncomingMessage,
+  res: ServerResponse,
+  repo: Repo,
+  key: string,
+  build: () => unknown,
+): void {
+  const etag = cacheETag(repo.version, key);
+  if ((req.headers['if-none-match'] ?? '') === etag) {
+    res.writeHead(304, {
+      ETag: etag,
+      'X-GitHub-Request-Id': nextRequestId(),
+    });
+    res.end();
+    return;
+  }
+  const body = cachedJson(repo, repo.version, key, build);
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-GitHub-Request-Id': nextRequestId(),
+    'Content-Length': Buffer.byteLength(body),
+    ETag: etag,
+  });
+  res.end(body);
 }
 
 const repos = new Map<string, Repo>(); // `${owner}/${name}` -> Repo
@@ -572,7 +724,10 @@ export function listRepos(owner: string): Repo[] {
 }
 
 export function createRepoRecord(owner: string, name: string, description: string, isPrivate: boolean): Repo {
+  storeVersion++;
   const repo: Repo = {
+    version: 0,
+    serialized: new Map(),
     id: repoIdSeq++,
     owner,
     name,
@@ -773,14 +928,40 @@ const UPLOAD_V2_CAPS = 'ls-refs=unborn fetch=shallow thin-pack object-format=sha
 const UPLOAD_V0_CAPS = 'symref=HEAD:refs/heads/main side-band-64k agent=' + AGENT_NAME + ' ofs-delta thin-pack shallow';
 const RECEIVE_V0_CAPS = 'report-status side-band-64k delete-refs agent=' + AGENT_NAME + ' ofs-delta thin-pack';
 
-function v2Advertisement(): Buffer {
-  return Buffer.concat([
+/** The v2 advertisement never mentions a repo: it is one constant buffer,
+ * built once instead of re-concatenated on every ls-refs / info/refs hit. */
+const V2_ADVERTISEMENT: Buffer = (() => {
+  const parts: Buffer[] = [
     pktLine('# service=git-upload-pack\n'),
     pktLine('version 2\n'),
     // capabilities, one per pkt-line
     ...UPLOAD_V2_CAPS.split(' ').map((cap) => pktLine(`${cap}\n`)),
     PKT_FLUSH,
-  ]);
+  ];
+  return Buffer.concat(parts);
+})();
+
+function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
+}
+
+/** v0 advertisements list every ref, so they are rebuilt only when the
+ * repo's refs move: cached per (repo, version, service) in a WeakMap so a
+ * deleted repo's entries are collected with it. */
+const v0AdCache = new WeakMap<Repo, { version: number; upload: Buffer | null; receive: Buffer | null }>();
+
+function v0AdvertisementCached(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffer {
+  let slot = v0AdCache.get(repo);
+  if (slot === undefined || slot.version !== repo.version) {
+    slot = { version: repo.version, upload: null, receive: null };
+    v0AdCache.set(repo, slot);
+  }
+  const field = service === 'upload-pack' ? 'upload' : 'receive';
+  const hit = slot[field];
+  if (hit !== null) return hit;
+  const built = v0Advertisement(repo, service);
+  slot[field] = built;
+  return built;
 }
 
 function v0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffer {
@@ -823,8 +1004,20 @@ interface FetchRequest {
   deepen: number | null;
 }
 
+const fetchCache = new Map<string, ReturnType<typeof computeFetchUncached>>();
+
+function computeFetch(repo: Repo, req: FetchRequest): ReturnType<typeof computeFetchUncached> {
+  const key = JSON.stringify([repo.id, repo.version, req]);
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) { fetchCache.delete(key); fetchCache.set(key, hit); return hit; }
+  const result = computeFetchUncached(repo, req);
+  fetchCache.set(key, result);
+  if (fetchCache.size > 64) fetchCache.delete(fetchCache.keys().next().value!);
+  return result;
+}
+
 /** Compute the pack + shallow boundaries for a fetch request. */
-function computeFetch(repo: Repo, req: FetchRequest): { pack: Buffer; shallow: string[]; unshallow: string[]; acked: string[] } {
+function computeFetchUncached(repo: Repo, req: FetchRequest): { pack: Buffer; shallow: string[]; unshallow: string[]; acked: string[] } {
   const maxDepth = req.deepen === null ? Number.POSITIVE_INFINITY : req.deepen;
   const included = reachableObjects(req.wants, maxDepth);
   // Exclusion: a have the client holds with full history excludes its whole
@@ -986,6 +1179,7 @@ function handleGitUploadPackV0(repo: Repo, body: Buffer): Buffer {
 }
 
 function handleGitReceivePack(repo: Repo, body: Buffer): Buffer {
+  bumpRepo(repo);
   const { lines, rest } = parsePktLines(body);
   const commands: { oldOid: string; newOid: string; ref: string }[] = [];
   for (const line of lines) {
@@ -1207,6 +1401,16 @@ function branchFiles(repo: Repo, ref: string | null): Map<string, FileEntry> | n
   return null;
 }
 
+const issueIndexes = new WeakMap<Repo, { length: number; index: Map<number, Issue> }>();
+function indexedIssue(repo: Repo, number: number): Issue | undefined {
+  let cached = issueIndexes.get(repo);
+  if (!cached || cached.length !== repo.issues.length) {
+    cached = { length: repo.issues.length, index: new Map(repo.issues.map(issue => [issue.number, issue])) };
+    issueIndexes.set(repo, cached);
+  }
+  return cached.index.get(number);
+}
+
 function handleRest(req: IncomingMessage, res: ServerResponse, pathname: string, query: URLSearchParams, body: Buffer): void {
   if (!checkAuth(req)) {
     sendError(res, 401, 'Bad credentials');
@@ -1216,6 +1420,28 @@ function handleRest(req: IncomingMessage, res: ServerResponse, pathname: string,
   // segments[0] === 'api', segments[1] === 'v3'
   const rest = segments.slice(2);
 
+  if (req.method === 'GET' && rest[0] === 'rate_limit') {
+    const core = { limit: 5000, remaining: 4999, reset: SCENARIO_EPOCH_SEC + 3600 };
+    sendJson(res, 200, { resources: { core, search: core, graphql: core }, rate: core });
+    return;
+  }
+  if (req.method === 'GET' && rest[0] === 'search') {
+    const q = (query.get('q') ?? '').toLowerCase();
+    const page = Math.max(1, Number(query.get('page')) || 1);
+    const size = Math.max(1, Number(query.get('per_page')) || 30);
+    const all = listRepos(VIEWER_LOGIN);
+    const items = rest[1] === 'repositories'
+      ? all.filter(repo => (repo.name + ' ' + repo.description).toLowerCase().includes(q)).map(repoJson)
+      : all.flatMap(repo => repo.issues.filter(issue => (issue.title + ' ' + issue.body).toLowerCase().includes(q)).map(issueJson));
+    sendJson(res, 200, { total_count: items.length, incomplete_results: false, items: items.slice((page - 1) * size, page * size) });
+    return;
+  }
+  if (req.method === 'GET' && rest[0] === 'users' && rest[2] === 'repos') {
+    const page = Math.max(1, Number(query.get('page')) || 1);
+    const size = Math.max(1, Number(query.get('per_page')) || 30);
+    sendJson(res, 200, listRepos(rest[1]!).slice((page - 1) * size, page * size).map(repoJson));
+    return;
+  }
   // GET /api/v3/  (root) and /api/v3/meta, /api/v3/user
   if (rest.length === 0) {
     if (req.method === 'GET') {
@@ -1272,15 +1498,20 @@ function handleRest(req: IncomingMessage, res: ServerResponse, pathname: string,
     sendJson(res, 201, repoJson(repo));
     return;
   }
-  // GET /api/v3/user/repos (paginated)
+  // GET /api/v3/user/repos (paginated). The list is a pure function of the
+  // store generation, so cache the serialized repo objects per version and
+  // slice pages from the cached array instead of re-mapping every repo.
   if (rest.length === 2 && rest[0] === 'user' && rest[1] === 'repos' && req.method === 'GET') {
     const perPage = Math.max(1, parseInt(query.get('per_page') ?? '30', 10) || 30);
     const page = Math.max(1, parseInt(query.get('page') ?? '1', 10) || 1);
-    const all = listRepos(VIEWER_LOGIN);
+    if (userReposCache === null || userReposCache.version !== storeVersion) {
+      const all = listRepos(VIEWER_LOGIN);
+      userReposCache = { version: storeVersion, total: all.length, items: all.map((repo) => repoJson(repo)) };
+    }
     const start = (page - 1) * perPage;
-    const slice = all.slice(start, start + perPage);
+    const slice = userReposCache.items.slice(start, start + perPage);
     const extra: Record<string, string> = {};
-    const totalPages = Math.max(1, Math.ceil(all.length / perPage));
+    const totalPages = Math.max(1, Math.ceil(userReposCache.total / perPage));
     if (page < totalPages) {
       const host = req.headers.host ?? 'localhost';
       const proto = 'http';
@@ -1288,7 +1519,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, pathname: string,
       const lastUrl = `${proto}://${host}/api/v3/user/repos?per_page=${perPage}&page=${totalPages}`;
       extra.Link = `<${nextUrl}>; rel="next", <${lastUrl}>; rel="last"`;
     }
-    sendJson(res, 200, slice.map((repo) => repoJson(repo)), extra);
+    sendJson(res, 200, slice, extra);
     return;
   }
   // /api/v3/repos/{owner}/{repo}[/...]
@@ -1306,10 +1537,11 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
     sendError(res, 404, 'Not Found');
     return;
   }
+  if (req.method !== 'GET' && req.method !== 'HEAD') bumpRepo(repo);
   // Repo object itself.
   if (tail.length === 0) {
     if (req.method === 'GET') {
-      sendJson(res, 200, repoJson(repo));
+      sendCachedJsonConditional(req, res, repo, 'repo', () => repoJson(repo));
       return;
     }
     if (req.method === 'PATCH') {
@@ -1319,7 +1551,7 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
         return;
       }
       if (typeof parsed.value.description === 'string') repo.description = parsed.value.description;
-      sendJson(res, 200, repoJson(repo));
+      sendCachedJson(res, repo, 'repo', () => repoJson(repo));
       return;
     }
     if (req.method === 'DELETE') {
@@ -1335,11 +1567,13 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
   // Branches.
   if (section === 'branches') {
     if (sub.length === 0 && req.method === 'GET') {
-      const out: Record<string, unknown>[] = [];
-      for (const [branchName, branch] of repo.branches) {
-        out.push({ name: branchName, commit: { sha: branch.tip }, protected: false });
-      }
-      sendJson(res, 200, out);
+      sendCachedJson(res, repo, 'branches', () => {
+        const out: Record<string, unknown>[] = [];
+        for (const [branchName, branch] of repo.branches) {
+          out.push({ name: branchName, commit: { sha: branch.tip }, protected: false });
+        }
+        return out;
+      });
       return;
     }
     if (sub.length === 1 && req.method === 'GET') {
@@ -1348,7 +1582,7 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
         sendError(res, 404, 'Not Found');
         return;
       }
-      sendJson(res, 200, { name: sub[0], commit: { sha: branch.tip }, protected: false });
+      sendCachedJson(res, repo, `branch:${sub[0]}`, () => ({ name: sub[0], commit: { sha: branch.tip }, protected: false }));
       return;
     }
     sendError(res, 404, 'Not Found');
@@ -1356,6 +1590,19 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
   }
   // Git refs.
   if (section === 'git' && sub.length >= 1 && sub[0] === 'refs') {
+    if (req.method === 'GET' && sub.length === 1) {
+      // List every ref (matching refs), newest names first by ref string.
+      const matching = query.get('matching') ?? '';
+      sendCachedJson(res, repo, `refs-list:${matching}`, () => {
+        const out: Record<string, unknown>[] = [];
+        for (const [ref, oid] of [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+          if (matching !== '' && !ref.includes(matching)) continue;
+          out.push({ ref, object: { sha: oid } });
+        }
+        return out;
+      });
+      return;
+    }
     if (req.method === 'POST' && sub.length === 1) {
       const parsed = parseJsonBody(body);
       if (!parsed.ok) {
@@ -1379,7 +1626,7 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
         sendError(res, 404, 'Not Found');
         return;
       }
-      sendJson(res, 200, { ref, object: { sha: oid } });
+      sendCachedJson(res, repo, `ref:${ref}`, () => ({ ref, object: { sha: oid } }));
       return;
     }
     sendError(res, 404, 'Not Found');
@@ -1387,6 +1634,25 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
   }
   // Commits.
   if (section === 'commits' && req.method === 'GET') {
+    // Single commit: /commits/:sha (oid, branch, or ref — same resolution
+    // as the git object endpoints).
+    if (sub.length === 1) {
+      const ref = sub[0]!;
+      let oid: string | null = objects.has(ref) ? ref : null;
+      if (oid === null) {
+        oid = repo.branches.get(ref)?.tip ?? repo.refs.get(`refs/heads/${ref}`) ?? repo.refs.get(ref) ?? null;
+      }
+      const obj = oid !== null ? objects.get(oid) : undefined;
+      if (obj === undefined || obj.type !== 'commit') {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      sendCachedJson(res, repo, `commit:${oid}`, () => {
+        const base = commitJson(oid!);
+        return { ...base, parents: obj.parents.map((p) => ({ sha: p })), tree: { sha: obj.tree } };
+      });
+      return;
+    }
     const ref = query.get('sha') ?? repo.defaultBranch;
     let tip: string | undefined;
     const branch = repo.branches.get(ref);
@@ -1411,7 +1677,10 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
       if (obj !== undefined && obj.type === 'commit') stack.push(...obj.parents);
     }
     void commits;
-    sendJson(res, 200, ordered.map((oid) => commitJson(oid)));
+    // The commit list is a pure function of (tip, repo version): the walk
+    // above is the expensive part on deep histories, so cache the whole
+    // serialized list per tip+version instead of rebuilding it per request.
+    sendCachedJson(res, repo, `commits:${tip}`, () => ordered.map((oid) => commitJson(oid)));
     return;
   }
   // Contents.
@@ -1422,7 +1691,16 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
   // Labels.
   if (section === 'labels') {
     if (req.method === 'GET' && sub.length === 0) {
-      sendJson(res, 200, [...repo.labels.values()].map((label) => ({ name: label.name, color: label.color })));
+      sendCachedJson(res, repo, 'labels', () => [...repo.labels.values()].map((label) => ({ name: label.name, color: label.color })));
+      return;
+    }
+    if (req.method === 'GET' && sub.length === 1) {
+      const label = repo.labels.get(sub[0]!);
+      if (label === undefined) {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      sendCachedJson(res, repo, `label:${label.name}`, () => ({ name: label.name, color: label.color }));
       return;
     }
     if (req.method === 'POST' && sub.length === 0) {
@@ -1444,6 +1722,195 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
       const color = typeof parsed.value.color === 'string' ? parsed.value.color : 'ededed';
       repo.labels.set(labelName, { name: labelName, color });
       sendJson(res, 201, { name: labelName, color });
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+    return;
+  }
+  // Tags — derived from refs/tags/*, newest first by ref name.
+  if (section === 'tags') {
+    if (req.method === 'GET' && sub.length === 0) {
+      sendCachedJson(res, repo, 'tags', () => {
+        const tags: Record<string, unknown>[] = [];
+        for (const [ref, oid] of [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+          if (!ref.startsWith('refs/tags/')) continue;
+          tags.push({ name: ref.slice('refs/tags/'.length), commit: { sha: oid } });
+        }
+        return tags;
+      });
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+    return;
+  }
+  // Releases — derived from annotated tags: each tag object is a release
+  // pointing at its target commit. Lightweight tags have no release.
+  if (section === 'releases') {
+    if (req.method === 'GET' && sub.length === 0) {
+      sendCachedJson(res, repo, 'releases', () => {
+        const releases: Record<string, unknown>[] = [];
+        for (const [ref, oid] of [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+          if (!ref.startsWith('refs/tags/')) continue;
+          const obj = objects.get(oid);
+          if (obj === undefined || obj.type !== 'tag' || obj.tagTarget === null) continue;
+          releases.push({
+            tag_name: ref.slice('refs/tags/'.length),
+            name: ref.slice('refs/tags/'.length),
+            draft: false,
+            prerelease: false,
+            target_commitish: repo.defaultBranch,
+            target_commit: obj.tagTarget.object,
+          });
+        }
+        return releases;
+      });
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+    return;
+  }
+  // Languages — byte counts per language, derived from the default
+  // branch's file extensions (the same mapping GitHub's linguist uses for
+  // the common extensions; unknown extensions are grouped as Other).
+  if (section === 'languages') {
+    if (req.method === 'GET' && sub.length === 0) {
+      sendCachedJson(res, repo, 'languages', () => {
+        const byExt: Record<string, string> = {
+          ts: 'TypeScript', js: 'JavaScript', mjs: 'JavaScript', py: 'Python',
+          go: 'Go', rs: 'Rust', java: 'Java', c: 'C', h: 'C', cpp: 'C++',
+          rb: 'Ruby', php: 'PHP', sh: 'Shell', md: 'Markdown', json: 'JSON',
+          html: 'HTML', css: 'CSS', sol: 'Solidity', mov: 'Move',
+        };
+        const out: Record<string, number> = {};
+        const branch = repo.branches.get(repo.defaultBranch);
+        if (branch !== undefined) {
+          for (const [filePath, entry] of branch.files) {
+            const ext = filePath.split('.').pop() ?? '';
+            const lang = byExt[ext] ?? 'Other';
+            const size = objects.get(entry.oid)?.data.length ?? 0;
+            out[lang] = (out[lang] ?? 0) + size;
+          }
+        }
+        return out;
+      });
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+    return;
+  }
+  // Contributors — commit counts per author login. Every commit the forge
+  // builds is authored by the viewer, so this is a single row in practice;
+  // the walk is still over real history, not a constant.
+  if (section === 'contributors') {
+    if (req.method === 'GET' && sub.length === 0) {
+      sendCachedJson(res, repo, 'contributors', () => {
+        const tip = repo.branches.get(repo.defaultBranch)?.tip ?? '';
+        const count = tip === '' ? 0 : reachableCommits([tip], Number.POSITIVE_INFINITY).size;
+        return count === 0
+          ? []
+          : [{ login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User', contributions: count }];
+      });
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+    return;
+  }
+  // Git objects: /git/trees/:sha, /git/blobs/:sha, /git/commits/:sha.
+  // :sha accepts a raw oid, a branch name, or a full ref — branch/ref
+  // names resolve to the tip commit (and, for trees, its tree).
+  if (section === 'git' && sub.length >= 2 && ['trees', 'blobs', 'commits'].includes(sub[0]!)) {
+    const kind = sub[0]!;
+    const sha = sub[1]!;
+    if (req.method === 'GET') {
+      const resolveCommit = (ref: string): string | null => {
+        if (objects.has(ref)) return ref;
+        if (ref === 'HEAD') ref = repo.defaultBranch;
+        const branchTip = repo.branches.get(ref)?.tip ?? repo.refs.get(`refs/heads/${ref}`) ?? repo.refs.get(ref) ?? null;
+        return branchTip !== null && branchTip !== '' ? branchTip : null;
+      };
+      const obj = objects.get(sha);
+      if (kind === 'blobs' && obj === undefined) {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      if (kind === 'trees') {
+        let treeSha: string | null = null;
+        if (obj !== undefined && obj.type === 'tree') treeSha = sha;
+        else {
+          const commitOid = resolveCommit(sha);
+          const commitObj = commitOid !== null ? objects.get(commitOid) : undefined;
+          if (commitObj !== undefined && commitObj.type === 'commit') treeSha = commitObj.tree;
+        }
+        if (treeSha === null || treeSha === '') {
+          sendError(res, 404, 'Not Found');
+          return;
+        }
+        const recursive = query.get('recursive') === '1';
+        sendCachedJson(res, repo, `git-tree:${treeSha}:${recursive ? 'r' : '1'}`, () => {
+          const entries: Record<string, unknown>[] = [];
+          const walk = (treeOid: string, prefix: string): void => {
+            const treeObj = objects.get(treeOid);
+            if (treeObj === undefined || treeObj.type !== 'tree') return;
+            for (const entry of parseTree(treeObj.data)) {
+              const child = objects.get(entry.oid);
+              const type = child?.type === 'tree' ? 'tree' : 'blob';
+              entries.push({ path: prefix + entry.name, mode: entry.mode, type, sha: entry.oid });
+              if (recursive && type === 'tree') walk(entry.oid, `${prefix}${entry.name}/`);
+            }
+          };
+          walk(treeSha!, '');
+          return { sha: treeSha, tree: entries };
+        });
+        return;
+      }
+      if (kind === 'blobs') {
+        if (obj === undefined || obj.type !== 'blob') {
+          sendError(res, 422, 'Not a blob');
+          return;
+        }
+        sendCachedJson(res, repo, `git-blob:${sha}`, () => ({
+          sha,
+          size: obj.data.length,
+          encoding: 'base64',
+          content: obj.data.toString('base64'),
+        }));
+        return;
+      }
+      // commits
+      const commitOid = resolveCommit(sha);
+      const commitObj = commitOid !== null ? objects.get(commitOid) : undefined;
+      if (commitObj === undefined || commitObj.type !== 'commit') {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      sendCachedJson(res, repo, `git-commit:${commitOid}`, () => {
+        const base = commitJson(commitOid!);
+        return { ...base, parents: commitObj.parents.map((p) => ({ sha: p })), tree: { sha: commitObj.tree } };
+      });
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+    return;
+  }
+  // Stats — commit activity: 52 weeks of commit counts for the default
+  // branch. The forge stamps every commit with the scenario epoch, so the
+  // counts land in week 0; the walk itself is over real history, and the
+  // shape matches the GitHub stats API (52 entries, {week, total}).
+  if (section === 'stats') {
+    if (req.method === 'GET' && sub.length === 1 && sub[0] === 'commit_activity') {
+      sendCachedJson(res, repo, 'stats-commit-activity', () => {
+        const tip = repo.branches.get(repo.defaultBranch)?.tip ?? '';
+        const total = tip === '' ? 0 : reachableCommits([tip], Number.POSITIVE_INFINITY).size;
+        const weeks: Record<string, unknown>[] = [];
+        for (let w = 0; w < 52; w++) {
+          weeks.push({
+            week: SCENARIO_EPOCH_SEC + w * 604800,
+            total: w === 0 ? total : 0,
+            days: w === 0 ? [total, 0, 0, 0, 0, 0, 0] : [0, 0, 0, 0, 0, 0, 0],
+          });
+        }
+        return weeks;
+      });
       return;
     }
     sendError(res, 404, 'Not Found');
@@ -1471,43 +1938,53 @@ function handleContents(req: IncomingMessage, res: ServerResponse, repo: Repo, p
   }
   const branchName = ref !== null && repo.branches.has(ref) ? ref : repo.defaultBranch;
   if (req.method === 'GET') {
-    // Exact file?
+    // Exact file? Content is addressed by (branch ref, path, repo version):
+    // the base64 body is the expensive part to rebuild, so cache it.
     const entry = files.get(path);
     if (entry !== undefined) {
-      const data = objects.get(entry.oid)?.data ?? Buffer.alloc(0);
-      sendJson(res, 200, {
-        type: 'file',
-        name: path.split('/').pop() ?? path,
-        path,
-        sha: entry.oid,
-        size: data.length,
-        encoding: 'base64',
-        content: data.toString('base64'),
+      sendCachedJson(res, repo, `content:file:${ref ?? ''}:${path}`, () => {
+        const data = objects.get(entry.oid)?.data ?? Buffer.alloc(0);
+        return {
+          type: 'file',
+          name: path.split('/').pop() ?? path,
+          path,
+          sha: entry.oid,
+          size: data.length,
+          encoding: 'base64',
+          content: data.toString('base64'),
+        };
       });
       return;
     }
-    // Directory listing: immediate children of `path` ('' = root).
+    // Directory listing: immediate children of `path` ('' = root). The
+    // walk + sort run only on a cache miss (inside the build closure); a
+    // cheap prefix scan up front decides the 404 without building anything.
     const prefix = path === '' ? '' : `${path}/`;
-    const children = new Map<string, { type: 'file' | 'dir'; name: string; path: string; sha: string }>();
-    for (const [filePath, fileEntry] of files) {
-      if (!filePath.startsWith(prefix)) continue;
-      const rest = filePath.slice(prefix.length);
-      const slash = rest.indexOf('/');
-      if (slash === -1) {
-        children.set(rest, { type: 'file', name: rest, path: filePath, sha: fileEntry.oid });
-      } else {
-        const dirName = rest.slice(0, slash);
-        if (!children.has(dirName)) {
-          children.set(dirName, { type: 'dir', name: dirName, path: `${prefix}${dirName}`, sha: '' });
-        }
-      }
+    let anyChild = false;
+    for (const filePath of files.keys()) {
+      if (filePath.startsWith(prefix)) { anyChild = true; break; }
     }
-    if (children.size === 0) {
+    if (!anyChild) {
       sendError(res, 404, 'Not Found');
       return;
     }
-    const out = [...children.values()].sort((a, b) => (a.name < b.name ? -1 : 1));
-    sendJson(res, 200, out);
+    sendCachedJson(res, repo, `content:dir:${ref ?? ''}:${path}`, () => {
+      const children = new Map<string, { type: 'file' | 'dir'; name: string; path: string; sha: string }>();
+      for (const [filePath, fileEntry] of files) {
+        if (!filePath.startsWith(prefix)) continue;
+        const rest = filePath.slice(prefix.length);
+        const slash = rest.indexOf('/');
+        if (slash === -1) {
+          children.set(rest, { type: 'file', name: rest, path: filePath, sha: fileEntry.oid });
+        } else {
+          const dirName = rest.slice(0, slash);
+          if (!children.has(dirName)) {
+            children.set(dirName, { type: 'dir', name: dirName, path: `${prefix}${dirName}`, sha: '' });
+          }
+        }
+      }
+      return [...children.values()].sort((a, b) => (a.name < b.name ? -1 : 1));
+    });
     return;
   }
   if (req.method === 'PUT') {
@@ -1620,12 +2097,13 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, repo: Repo, sub
     if (req.method === 'GET') {
       const state = query.get('state') ?? 'open';
       const direction = query.get('direction') ?? 'desc';
-      let list = repo.issues.filter((issue) => state === 'all' || issue.state === state);
-      list = [...list].sort((a, b) => (direction === 'asc' ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq));
       const perPage = Math.max(1, parseInt(query.get('per_page') ?? '30', 10) || 30);
       const page = Math.max(1, parseInt(query.get('page') ?? '1', 10) || 1);
-      const slice = list.slice((page - 1) * perPage, page * perPage);
-      sendJson(res, 200, slice.map((issue) => issueJson(issue)));
+      sendCachedJsonConditional(req, res, repo, `issues:${state}:${direction}:${page}:${perPage}`, () => {
+        let list = repo.issues.filter((issue) => state === 'all' || issue.state === state);
+        list = [...list].sort((a, b) => (direction === 'asc' ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq));
+        return list.slice((page - 1) * perPage, page * perPage).map((issue) => issueJson(issue));
+      });
       return;
     }
     sendError(res, 404, 'Not Found');
@@ -1633,14 +2111,14 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, repo: Repo, sub
   }
   // /issues/{number}[/comments]
   const number = parseInt(sub[0]!, 10);
-  const issue = repo.issues.find((item) => item.number === number);
+  const issue = indexedIssue(repo, number);
   if (issue === undefined) {
     sendError(res, 404, 'Not Found');
     return;
   }
   if (sub.length === 1) {
     if (req.method === 'GET') {
-      sendJson(res, 200, issueJson(issue));
+      sendCachedJsonConditional(req, res, repo, `issue:${issue.number}`, () => issueJson(issue));
       return;
     }
     if (req.method === 'PATCH') {
@@ -1652,7 +2130,15 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, repo: Repo, sub
       if (parsed.value.state === 'closed' || parsed.value.state === 'open') issue.state = parsed.value.state;
       if (typeof parsed.value.title === 'string') issue.title = parsed.value.title;
       if (typeof parsed.value.body === 'string') issue.body = parsed.value.body;
-      sendJson(res, 200, issueJson(issue));
+      sendCachedJson(res, repo, `issue:${issue.number}`, () => issueJson(issue));
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+    return;
+  }
+  if (sub.length === 2 && sub[1] === 'labels') {
+    if (req.method === 'GET') {
+      sendCachedJson(res, repo, `issue-labels:${issue.number}`, () => issue.labels.map((label) => ({ name: label.name, color: label.color })));
       return;
     }
     sendError(res, 404, 'Not Found');
@@ -1660,7 +2146,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, repo: Repo, sub
   }
   if (sub.length === 2 && sub[1] === 'comments') {
     if (req.method === 'GET') {
-      sendJson(res, 200, issue.comments.map((comment) => ({ id: comment.id, body: comment.body })));
+      sendCachedJson(res, repo, `issue-comments:${issue.number}`, () => issue.comments.map((comment) => ({ id: comment.id, body: comment.body })));
       return;
     }
     if (req.method === 'POST') {
@@ -1734,13 +2220,14 @@ function handlePulls(req: IncomingMessage, res: ServerResponse, repo: Repo, sub:
     }
     if (req.method === 'GET') {
       const state = query.get('state') ?? 'open';
-      let list = repo.pulls;
-      if (state === 'open') list = list.filter((pull) => pull.state === 'open');
-      else if (state === 'closed') list = list.filter((pull) => pull.state === 'closed' || pull.state === 'merged');
       const perPage = Math.max(1, parseInt(query.get('per_page') ?? '30', 10) || 30);
       const page = Math.max(1, parseInt(query.get('page') ?? '1', 10) || 1);
-      const slice = list.slice((page - 1) * perPage, page * perPage);
-      sendJson(res, 200, slice.map((pull) => pullJson(pull)));
+      sendCachedJson(res, repo, `pulls:${state}:${page}:${perPage}`, () => {
+        let list = repo.pulls;
+        if (state === 'open') list = list.filter((pull) => pull.state === 'open');
+        else if (state === 'closed') list = list.filter((pull) => pull.state === 'closed' || pull.state === 'merged');
+        return list.slice((page - 1) * perPage, page * perPage).map((pull) => pullJson(pull));
+      });
       return;
     }
     sendError(res, 404, 'Not Found');
@@ -1754,7 +2241,7 @@ function handlePulls(req: IncomingMessage, res: ServerResponse, repo: Repo, sub:
   }
   if (sub.length === 1) {
     if (req.method === 'GET') {
-      sendJson(res, 200, pullJson(pull));
+      sendCachedJsonConditional(req, res, repo, `pull:${pull.number}`, () => pullJson(pull));
       return;
     }
     sendError(res, 404, 'Not Found');
@@ -1767,16 +2254,47 @@ function handlePulls(req: IncomingMessage, res: ServerResponse, repo: Repo, sub:
       sendJson(res, 200, []);
       return;
     }
-    const base = mergeBase(headBranch.tip, baseBranch.tip);
-    const baseFiles = base !== null ? treeToFiles(objects.get(base)?.tree ?? '') : baseBranch.files;
-    const changed = diffFiles(baseFiles, headBranch.files);
-    sendJson(res, 200, changed.map((file) => ({
-      filename: file.filename,
-      status: file.status,
-      additions: file.additions,
-      deletions: file.deletions,
-      changes: file.changes,
-    })));
+    // The diff is a pure function of (head tip, base tip, repo version):
+    // mergeBase + two diffs over the whole tree are the expensive part.
+    sendCachedJson(res, repo, `pull-files:${pull.number}:${headBranch.tip}:${baseBranch.tip}`, () => {
+      const base = mergeBase(headBranch.tip, baseBranch.tip);
+      const baseFiles = base !== null ? treeToFiles(objects.get(base)?.tree ?? '') : baseBranch.files;
+      const changed = diffFiles(baseFiles, headBranch.files);
+      return changed.map((file) => ({
+        filename: file.filename,
+        status: file.status,
+        additions: file.additions,
+        deletions: file.deletions,
+        changes: file.changes,
+      }));
+    });
+    return;
+  }
+  if (sub.length === 2 && sub[1] === 'commits' && req.method === 'GET') {
+    // The PR's commits: head-branch history minus the merge-base history,
+    // newest first — a real walk over the object store, cached per tip pair.
+    const headBranch = repo.branches.get(pull.headRef);
+    const baseBranch = repo.branches.get(pull.baseRef);
+    if (headBranch === undefined || baseBranch === undefined) {
+      sendJson(res, 200, []);
+      return;
+    }
+    sendCachedJson(res, repo, `pull-commits:${pull.number}:${headBranch.tip}:${baseBranch.tip}`, () => {
+      const base = mergeBase(headBranch.tip, baseBranch.tip);
+      const baseSet = base !== null ? reachableCommits([base], Number.POSITIVE_INFINITY) : new Set<string>();
+      const ordered: string[] = [];
+      const seen = new Set<string>();
+      const stack = [headBranch.tip];
+      while (stack.length > 0) {
+        const oid = stack.pop()!;
+        if (seen.has(oid) || baseSet.has(oid)) continue;
+        seen.add(oid);
+        ordered.push(oid);
+        const obj = objects.get(oid);
+        if (obj !== undefined && obj.type === 'commit') stack.push(...obj.parents);
+      }
+      return ordered.map((oid) => commitJson(oid));
+    });
     return;
   }
   if (sub.length === 2 && sub[1] === 'merge' && req.method === 'PUT') {
@@ -1915,6 +2433,7 @@ function graphqlIssuesConnection(repo: Repo, query: string, variables: Record<st
     ? Buffer.from(`issue:${page[page.length - 1]!.number}`, 'utf8').toString('base64')
     : null;
   return {
+    totalCount: list.length,
     nodes: page.map((issue) => graphqlIssueObject(repo, issue)),
     pageInfo: { hasNextPage, endCursor },
   };
@@ -1938,7 +2457,7 @@ function graphqlRepoObject(repo: Repo, query: string, variables: Record<string, 
     ? parseInt(issueNumMatch[1]!, 10)
     : typeof variables.number === 'number' ? variables.number : null;
   if (issueNumber !== null) {
-    const issue = repo.issues.find((item) => item.number === issueNumber);
+    const issue = indexedIssue(repo, issueNumber);
     obj.issue = issue !== undefined ? graphqlIssueObject(repo, issue) : null;
   }
   // issues connection
@@ -2042,6 +2561,7 @@ function handleGraphqlOperation(query: string, variables: Record<string, unknown
   }
   // Mutations.
   if (flat.includes('mutation')) {
+    for (const repo of repos.values()) bumpRepo(repo);
     const input = (variables.input ?? {}) as Record<string, unknown>;
     if (flat.includes('createIssue')) {
       const repo = typeof input.repositoryId === 'string' ? findRepoByOpaqueId(input.repositoryId) : null;
@@ -2195,6 +2715,63 @@ function handleGraphqlOperation(query: string, variables: Record<string, unknown
     }
     return { data: { node: null } };
   }
+  // search(query:, type:) — full-text search over the viewer's repos and
+  // issues. The query comes from variables when present, else from the
+  // document literal; type defaults to ISSUE. Results are a connection
+  // shaped like the issues connection (edges + issueCount / repositoryCount
+  // + totalCount), so clients can page it the same way.
+  if (flat.includes('search(')) {
+    const qVar = typeof variables.query === 'string' ? variables.query : null;
+    const qLit = /search\s*\(\s*query\s*:\s*"([^"]*)"/.exec(compact)?.[1] ?? null;
+    const q = (qVar ?? qLit ?? '').toLowerCase();
+    const typeVar = typeof variables.type === 'string' ? variables.type.toUpperCase() : null;
+    const typeLit = /type\s*:\s*([A-Z_]+)/.exec(compact)?.[1] ?? null;
+    const type = typeVar ?? typeLit ?? 'ISSUE';
+    const firstVar = typeof variables.first === 'number' ? variables.first : null;
+    const firstLit = /first\s*:\s*(\d+)/.exec(compact)?.[1] ?? null;
+    const first = Math.max(1, firstVar ?? (firstLit !== null ? parseInt(firstLit, 10) : 10));
+    if (type === 'REPOSITORY') {
+      const matched = [...repos.values()].filter(
+        (repo) => repo.owner === VIEWER_LOGIN && (repo.name + ' ' + repo.description).toLowerCase().includes(q),
+      );
+      return {
+        data: {
+          search: {
+            repositoryCount: matched.length,
+            totalCount: matched.length,
+            edges: matched.slice(0, first).map((repo) => ({
+              node: {
+                __typename: 'Repository',
+                id: opaqueId('R', repo.id),
+                name: repo.name,
+                nameWithOwner: `${repo.owner}/${repo.name}`,
+                description: repo.description,
+              },
+            })),
+          },
+        },
+      };
+    }
+    const matched: { repo: Repo; issue: Issue }[] = [];
+    for (const repo of repos.values()) {
+      if (repo.owner !== VIEWER_LOGIN) continue;
+      for (const issue of repo.issues) {
+        if ((issue.title + ' ' + issue.body).toLowerCase().includes(q)) matched.push({ repo, issue });
+      }
+    }
+    matched.sort((a, b) => b.issue.createdSeq - a.issue.createdSeq);
+    return {
+      data: {
+        search: {
+          issueCount: matched.length,
+          totalCount: matched.length,
+          edges: matched.slice(0, first).map(({ repo, issue }) => ({
+            node: { __typename: 'Issue', ...graphqlIssueObject(repo, issue) },
+          })),
+        },
+      },
+    };
+  }
   // Repository queries.
   if (flat.includes('repository(')) {
     const owner = typeof variables.owner === 'string' ? variables.owner : null;
@@ -2264,6 +2841,8 @@ interface McpTool {
 
 // Fixed tool list, in a fixed order: two tools/list calls must be byte-identical.
 const MCP_TOOLS: McpTool[] = [
+  { name: 'list_repos', description: 'List repositories.', inputSchema: { type: 'object', properties: {}, required: [] } },
+  { name: 'get_issue', description: 'Get an issue.', inputSchema: { type: 'object', properties: { owner: { type: 'string', description: 'Owner.' }, repo: { type: 'string', description: 'Repository.' }, issue_number: { type: 'number', description: 'Issue number.' } }, required: ['owner', 'repo', 'issue_number'] } },
   {
     name: 'create_repo',
     description: 'Create a repository owned by the authenticated user.',
@@ -2395,7 +2974,18 @@ function mcpErrorResult(text: string): Record<string, unknown> {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
+/** MCP list_repos result, cached per store generation: the repo list only
+ * changes when a repo is created/deleted or its description changes, and
+ * all three paths bump storeVersion. */
+let mcpListReposCache: { version: number; text: string } | null = null;
+
 function handleMcpToolsCall(name: string, args: Record<string, unknown>): Record<string, unknown> {
+  if (name === 'list_repos') {
+    if (mcpListReposCache === null || mcpListReposCache.version !== storeVersion) {
+      mcpListReposCache = { version: storeVersion, text: JSON.stringify(listRepos(VIEWER_LOGIN).map(repoJson)) };
+    }
+    return mcpTextResult(mcpListReposCache.text);
+  }
   if (name === 'create_repo') {
     const repoName = mcpPickString(args, 'name', 'repo', 'repository', 'repository_name', 'repo_name');
     if (repoName === null) return mcpErrorResult('Missing required argument: name');
@@ -2405,12 +2995,17 @@ function handleMcpToolsCall(name: string, args: Record<string, unknown>): Record
     const repo = createRepoRecord(VIEWER_LOGIN, repoName, description, isPrivate);
     return mcpTextResult(JSON.stringify(repoJson(repo)));
   }
-  if (name === 'get_repo' || name === 'create_issue' || name === 'list_issues' || name === 'create_pull_request' || name === 'merge_pull_request') {
+  if (name === 'get_issue' || name === 'get_repo' || name === 'create_issue' || name === 'list_issues' || name === 'create_pull_request' || name === 'merge_pull_request') {
     const { owner, repo: repoName } = mcpOwnerRepo(args);
     if (owner === null || repoName === null) return mcpErrorResult('Missing required argument: owner or repo');
     const repo = owner === VIEWER_LOGIN ? getRepo(owner, repoName) : undefined;
     if (repo === undefined) return mcpErrorResult('Repository not found');
-    if (name === 'get_repo') return mcpTextResult(JSON.stringify(repoJson(repo)));
+    if (name === 'get_issue') {
+      const issue = indexedIssue(repo, Number(args.issue_number ?? args.number));
+      return issue === undefined ? mcpErrorResult('Issue not found') : mcpTextResult(cachedJson(repo, repo.version, `issue:${issue.number}`, () => issueJson(issue)));
+    }
+    if (name !== 'get_repo' && name !== 'list_issues') bumpRepo(repo);
+    if (name === 'get_repo') return mcpTextResult(cachedJson(repo, repo.version, 'repo', () => repoJson(repo)));
     if (name === 'create_issue') {
       const title = mcpPickString(args, 'title', 'issue_title', 'pr_title', 'pull_request_title', 'subject');
       if (title === null) return mcpErrorResult('Missing required argument: title');
@@ -2430,8 +3025,10 @@ function handleMcpToolsCall(name: string, args: Record<string, unknown>): Record
     }
     if (name === 'list_issues') {
       const state = mcpPickString(args, 'state', 'status') ?? 'open';
-      const list = repo.issues.filter((issue) => state === 'all' || issue.state === state);
-      return mcpTextResult(JSON.stringify(list.map((issue) => issueJson(issue))));
+      return mcpTextResult(cachedJson(repo, repo.version, `mcp-issues:${state}`, () => {
+        const list = repo.issues.filter((issue) => state === 'all' || issue.state === state);
+        return list.map((issue) => issueJson(issue));
+      }));
     }
     if (name === 'create_pull_request') {
       const title = mcpPickString(args, 'title', 'issue_title', 'pr_title', 'pull_request_title', 'subject');
@@ -2624,13 +3221,13 @@ export function createForge(): Forge {
           const service = url.searchParams.get('service');
           if (service === 'git-upload-pack') {
             const isV2 = req.headers['git-protocol'] === 'version=2';
-            const payload = isV2 ? v2Advertisement() : v0Advertisement(repo, 'upload-pack');
+            const payload = isV2 ? v2Advertisement() : v0AdvertisementCached(repo, 'upload-pack');
             res.writeHead(200, { 'Content-Type': 'application/x-git-upload-pack-advertisement', 'Content-Length': payload.length });
             res.end(payload);
             return;
           }
           if (service === 'git-receive-pack') {
-            const payload = v0Advertisement(repo, 'receive-pack');
+            const payload = v0AdvertisementCached(repo, 'receive-pack');
             res.writeHead(200, { 'Content-Type': 'application/x-git-receive-pack-advertisement', 'Content-Length': payload.length });
             res.end(payload);
             return;

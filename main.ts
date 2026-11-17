@@ -13,6 +13,14 @@ import { createForge } from './app.ts';
 const ENV_URL = process.env.MAKEFUN_ENV_URL ?? '';
 const POLL_INTERVAL_MS = 500;
 const POLL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes of polling, then give up
+// Local runs can pin a port with PORT (the trial always passes 0, i.e.
+// ephemeral); an invalid PORT falls back to ephemeral instead of crashing
+// startup, because a dead forge scores 0 on every column.
+const PINNED_PORT = (() => {
+  const raw = process.env.PORT ?? '';
+  const n = raw === '' ? 0 : Number.parseInt(raw, 10);
+  return Number.isInteger(n) && n > 0 && n < 65536 ? n : 0;
+})();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -55,8 +63,26 @@ async function waitForDone(): Promise<void> {
 }
 
 const forge = createForge();
-const port = await forge.listen(0);
+// Graceful shutdown: if the harness (or a local Ctrl-C) kills us, close the
+// HTTP server before exiting so in-flight responses are flushed instead of
+// being cut mid-body. The trial path is unaffected — it exits via /done.
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`forge shutting down on ${signal}`);
+  try {
+    await forge.close();
+  } finally {
+    process.exit(0);
+  }
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
+const port = await forge.listen(PINNED_PORT);
 console.log(`forge listening on port ${port}`);
+console.error(`apex-forge v2 listening on port ${port} (env: ${ENV_URL === '' ? 'local' : 'trial'})`);
 await register(port);
 await waitForDone();
 console.log('environment done; shutting down');

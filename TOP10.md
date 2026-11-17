@@ -60,3 +60,25 @@ inferred from titles + scores + RULES only; no top-10 code was read.
   only; no install, no git binary; pod 2 CPU, 1024 MB, 256 procs, read-only /bot,
   write only /tmp. Entry ≤16 MiB source total, ≤8 MiB any file. ≤5 submissions/day,
   ≤10 total. Force_Last.
+
+## v2 addendum (2026-11-17)
+
+- v1 submitted 2026-11-16, ranked #1673/6,015 (down from #1601/5,825) with
+  feature 600 + agent 200 + perf 0 — the perf column is the whole game, and
+  the current top 10 sit at 947–953 with perf 147–153 (p50 387–420 ms).
+- v2 attacks the read path the way the winners do: versioned JSON caches
+  (repeat GETs cost a Map lookup), a fetch-result LRU, single-pass pack
+  parsing, one-allocation pack assembly keyed by a 32-bit FNV fingerprint,
+  cached advertisements, and ETag/304 conditional GETs on the hottest reads.
+- Measured locally (microbench medians, 3 runs): read −19%, push −52%,
+  depth-1 clone −78%, full 200-commit clone −92% vs v1; HTTP probe:
+  GET issue 10.4 → 1.2 ms/req, GET /healthz 4.7 → 0.93 ms/req.
+- Coverage also widened toward the #5 pattern (997/1000 practice: git v2/v0,
+  REST v3, GraphQL, MCP): REST search, rate_limit, tags, releases,
+  languages, contributors, git trees/blobs/commits; GraphQL search;
+  MCP grew from 6 to 8 tools (list_repos, get_issue).
+- Lesson logged: a 64-bit BigInt FNV hash for the pack-cache key was slower
+  than the JSON.stringify key it replaced — 32-bit Math.imul FNV-1a is the
+  one that ships. Single-run microbench numbers on a shared 1.5-CPU VM are
+  noise-dominated (clone-full ranged 2–16 ms/op across runs); only medians
+  of repeated runs are reported.

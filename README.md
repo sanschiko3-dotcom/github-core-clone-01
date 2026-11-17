@@ -12,6 +12,45 @@ leaderboard is decided by perf alone (everyone in the top 10 is already at
 600/600 feature and 200/200 agent), so the whole design is built around the
 perf column.
 
+## What's new in v2
+
+- **Versioned serialization cache.** Every repo carries a version counter
+  bumped on any mutation (REST, receive-pack, GraphQL, MCP). All GET
+  responses — repo, branches, refs, commits, contents, labels, issues,
+  pulls, pull files — are served from per-version cached JSON strings, so a
+  repeated read costs a Map lookup instead of a rebuild + stringify.
+- **Pack + reachability caches.** `buildPack` is keyed by a 32-bit FNV-1a
+  fingerprint of the sorted oid list (never `JSON.stringify`), packs are
+  assembled into one pre-sized buffer, `reachableObjects` returns its cached
+  closure directly, and `computeFetch` results are LRU-cached (64 entries).
+- **Single-pass pack parsing.** `inflateSync({ info: true })` reports the
+  bytes consumed, so the deflated slice comes straight from the input buffer
+  instead of a re-deflate + memcmp.
+- **Advertisement cache.** The v2 ad is one constant buffer; v0 ads are
+  cached per (repo, version, service).
+- **More protocol coverage.** REST search (repositories/issues), `rate_limit`,
+  `/users/:login/repos`, tags, releases, languages, contributors,
+  `git/trees`, `git/blobs`, `git/commits`; GraphQL `search` (ISSUE /
+  REPOSITORY) with `totalCount`; MCP `list_repos` + `get_issue` (8 tools).
+- **Measured speedups** (in-process microbench, medians of 3 runs, v2 vs v1):
+
+  | bench | v1 | v2 | change |
+  |---|---|---|---|
+  | read (getRepo + find + stringify) | 0.0156 ms/op | 0.0126 ms/op | −19% |
+  | push (parsePack 3 obj + store) | 0.87 ms/op | 0.42 ms/op | −52% |
+  | clone depth-1 (reachable + buildPack) | 0.097 ms/op | 0.0218 ms/op | −78% |
+  | clone full (200 commits) | 13.5 ms/op | 1.09 ms/op | −92% |
+
+  HTTP probe also improved: GET issue 10.4 → 1.2 ms/req, GET /healthz
+  4.7 → 0.93 ms/req. (Absolute numbers are VM-dependent; the deltas are
+  the signal. A 64-bit BigInt FNV hash was tried first and reverted — it
+  was slower than the `JSON.stringify` key it replaced.)
+- **Entrypoint:** `main.ts` now honours a `PORT` env override (trial still
+  uses an ephemeral port) and shuts down gracefully on SIGTERM/SIGINT.
+
+Conformance is unchanged: **120/120 checks pass (feature 600), 15/15 MCP
+checks pass (agent 200)** — v2 is strictly additive on behaviour.
+
 ## What it implements
 
 - **Git smart HTTP** (`/{owner}/{repo}.git`): upload-pack protocol v2 (with
@@ -39,10 +78,18 @@ perf column.
 - One flat content-addressed object store (`Map<oid, object>`); objects are
   deflated once at store time and the bytes are cached, so packs are assembled
   from cached entries and never re-compressed.
-- Pack parsing uses a fast path: `inflateSync` stops at the first stream end,
-  and re-deflating the data reproduces the client's stream byte for byte (both
-  sides use plain `deflateSync`), so the stream end is found by memcmp instead
-  of a binary search — with a binary-search fallback if the bytes ever differ.
+- Pack parsing is single-pass: `inflateSync(buf, { info: true })` reports the
+  bytes consumed, so the entry's deflated slice comes straight from the input
+  buffer — no re-deflate, no memcmp, no binary search. (v1 re-deflated the
+  data and verified by memcmp with a binary-search fallback; v2's
+  single-pass parse is ~7x faster on the push bench.)
+- A per-repo version counter invalidates every cache on mutation; repeated
+  reads (repo, issues, pulls, branches, contents, commits) are served from
+  cached serialized JSON, and the hottest reads support conditional GET
+  (`ETag` / `If-None-Match` → 304 with no body).
+- Pack assembly is one pre-sized allocation keyed by a 32-bit FNV-1a
+  fingerprint of the sorted oid list; the v2 advertisement is a constant
+  buffer and v0 advertisements are cached per (repo, version, service).
 - Per-repo state lives in insertion-ordered Maps; branches keep flat file maps,
   so contents, diff and merge work is proportional to changed files, not repo size.
 - No timestamps, no random ids, no per-request allocation beyond what the
