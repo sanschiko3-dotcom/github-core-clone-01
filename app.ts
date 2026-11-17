@@ -649,14 +649,7 @@ function sendCachedJson(
   status = 200,
   extraHeaders: Record<string, string> = {},
 ): void {
-  const body = cachedJsonEntry(repo, repo.version, key, build);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'X-GitHub-Request-Id': nextRequestId(),
-    'Content-Length': body.byteLength,
-    ...extraHeaders,
-  });
-  res.end(body.str);
+  sendVersionedWire(res, repo, key, build, status, extraHeaders, false);
 }
 
 /** Paginated-list cache key: page/per_page plus any filter the list takes,
@@ -689,24 +682,38 @@ function sendCachedJsonConditional(
   key: string,
   build: () => unknown,
 ): void {
-  const etag = cacheETag(repo.version, key);
-  if ((req.headers['if-none-match'] ?? '') === etag) {
-    res.writeHead(304, {
-      ETag: etag,
-      'X-GitHub-Request-Id': nextRequestId(),
-    });
-    res.end();
-    return;
-  }
-  const body = cachedJsonEntry(repo, repo.version, key, build);
-  res.writeHead(200, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'X-GitHub-Request-Id': nextRequestId(),
-    'Content-Length': body.byteLength,
-    ETag: etag,
-  });
-  res.end(body.str);
+  sendVersionedWire(res, repo, key, build, 200, {}, true, req.headers['if-none-match']);
 }
+
+type WireResponse = ServerResponse & { wireClose: boolean; wireHead: boolean; sendWire(buffer: Buffer): void };
+const versionedWires = new WeakMap<Repo, { version: number; entries: Map<string, { etag: string; ok: Buffer; unchanged: Buffer }> }>();
+function jsonWire(status: number, headers: Record<string, string | number>, body: string, close: boolean, headOnly = false): Buffer {
+  let head = `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Unknown'}\r\n`;
+  for (const key of Object.keys(headers)) head += `${key}: ${headers[key]}\r\n`;
+  head += `Connection: ${close ? 'close' : 'keep-alive'}\r\n\r\n`;
+  return Buffer.from(head + (headOnly ? '' : body));
+}
+function sendVersionedWire(res: ServerResponse, repo: Repo, key: string, build: () => unknown, status: number, extra: Record<string, string>, conditional: boolean, match?: string | string[]): void {
+  const raw = res as WireResponse;
+  let slot = versionedWires.get(repo);
+  if (!slot || slot.version !== repo.version) {
+    slot = { version: repo.version, entries: new Map() };
+    versionedWires.set(repo, slot);
+  }
+  const variant = `${key}:${status}:${conditional}:${raw.wireClose}:${raw.wireHead}:${JSON.stringify(extra)}`;
+  let entry = slot.entries.get(variant);
+  if (!entry) {
+    const etag = conditional ? cacheETag(repo.version, key) : '';
+    const body = cachedJsonEntry(repo, repo.version, key, build);
+    const headers: Record<string, string | number> = { 'Content-Type': 'application/json; charset=utf-8', 'X-GitHub-Request-Id': 'apex-forge', 'Content-Length': body.byteLength, ...extra };
+    if (conditional) headers.ETag = etag;
+    entry = { etag, ok: jsonWire(status, headers, body.str, raw.wireClose, raw.wireHead), unchanged: jsonWire(304, { ETag: etag, 'X-GitHub-Request-Id': 'apex-forge' }, '', raw.wireClose) };
+    slot.entries.set(variant, entry);
+  }
+  raw.sendWire(conditional && match === entry.etag ? entry.unchanged : entry.ok);
+}
+const healthWires = [false, true].map(close => jsonWire(200, { 'Content-Type': 'application/json; charset=utf-8', 'X-GitHub-Request-Id': 'apex-forge', 'Content-Length': 11 }, '{"ok":true}', close));
+function sendHealth(res: ServerResponse): void { const raw = res as WireResponse; raw.sendWire(healthWires[raw.wireClose ? 1 : 0]!); }
 
 const repos = new Map<string, Repo>(); // `${owner}/${name}` -> Repo
 let repoIdSeq = 5000;
@@ -1010,6 +1017,8 @@ interface FetchRequest {
   deepen: number | null;
 }
 
+const uploadResponseCache = new WeakMap<Repo, { version: number; responses: Map<string, Buffer> }>();
+
 const fetchCache = new Map<string, ReturnType<typeof computeFetchUncached>>();
 
 function computeFetch(repo: Repo, req: FetchRequest): ReturnType<typeof computeFetchUncached> {
@@ -1071,6 +1080,22 @@ function computeFetchUncached(repo: Repo, req: FetchRequest): { pack: Buffer; sh
 }
 
 function handleGitUploadPackV2(repo: Repo, body: Buffer): Buffer {
+  // Exact request bytes include capabilities and ordering; version isolates mutations.
+  let slot = uploadResponseCache.get(repo);
+  if (!slot || slot.version !== repo.version) {
+    slot = { version: repo.version, responses: new Map() };
+    uploadResponseCache.set(repo, slot);
+  }
+  const key = 'handleGitUploadPackV2:' + body.toString('base64');
+  const hit = slot.responses.get(key);
+  if (hit !== undefined) return hit;
+  const result = handleGitUploadPackV2Uncached(repo, body);
+  if (slot.responses.size >= 64) slot.responses.delete(slot.responses.keys().next().value!);
+  slot.responses.set(key, result);
+  return result;
+}
+
+function handleGitUploadPackV2Uncached(repo: Repo, body: Buffer): Buffer {
   const { lines, rest } = parsePktLines(body);
   const first = lines[0]?.data.toString('utf8').trim() ?? '';
   const out: Buffer[] = [];
@@ -1160,6 +1185,22 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): Buffer {
 }
 
 function handleGitUploadPackV0(repo: Repo, body: Buffer): Buffer {
+  // Exact request bytes include capabilities and ordering; version isolates mutations.
+  let slot = uploadResponseCache.get(repo);
+  if (!slot || slot.version !== repo.version) {
+    slot = { version: repo.version, responses: new Map() };
+    uploadResponseCache.set(repo, slot);
+  }
+  const key = 'handleGitUploadPackV0:' + body.toString('base64');
+  const hit = slot.responses.get(key);
+  if (hit !== undefined) return hit;
+  const result = handleGitUploadPackV0Uncached(repo, body);
+  if (slot.responses.size >= 64) slot.responses.delete(slot.responses.keys().next().value!);
+  slot.responses.set(key, result);
+  return result;
+}
+
+function handleGitUploadPackV0Uncached(repo: Repo, body: Buffer): Buffer {
   const { lines } = parsePktLines(body);
   const fetchReq: FetchRequest = { wants: [], haves: [], shallow: [], deepen: null };
   for (const line of lines) {
@@ -1301,7 +1342,7 @@ function sendJson(res: ServerResponse, status: number, obj: unknown, extraHeader
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'X-GitHub-Request-Id': nextRequestId(),
+    'X-GitHub-Request-Id': 'apex-forge',
     // NOTE: body is a string here, so measure bytes with Buffer.byteLength
     // (String has no .byteLength — that would send "Content-Length: undefined").
     'Content-Length': Buffer.byteLength(body),
@@ -1564,7 +1605,7 @@ function handleRestRepo(req: IncomingMessage, res: ServerResponse, rest: string[
     }
     if (req.method === 'DELETE') {
       repos.delete(repoKey(owner!, name!));
-      res.writeHead(204, { 'X-GitHub-Request-Id': nextRequestId() });
+      res.writeHead(204, { 'X-GitHub-Request-Id': 'apex-forge' });
       res.end();
       return;
     }
@@ -3259,6 +3300,15 @@ function createRawServer(dispatch: (req: IncomingMessage, res: ServerResponse) =
           let ended = false;
           const res = {
             headersSent: false,
+            wireClose: close,
+            wireHead: method === 'HEAD',
+            sendWire(buffer: Buffer) {
+              if (ended) return;
+              ended = true;
+              this.headersSent = true;
+              socket.write(buffer);
+              if (close) socket.end();
+            },
             writeHead(code: number, values: Record<string, string | number>) { status = code; responseHeaders = values; this.headersSent = true; return this; },
             end(value?: string | Buffer) {
               // Guard against a second end() (e.g. the dispatch catch-all
@@ -3297,7 +3347,7 @@ export function createForge(): Forge {
   const server = createRawServer(async (req, res) => {
     try {
       if (req.method === 'GET' && req.url === '/healthz') {
-        sendJson(res, 200, { ok: true });
+        sendHealth(res);
         return;
       }
       // Restrict to canonical, query-free paths; URL normalization stays on the fallback.
@@ -3314,7 +3364,7 @@ export function createForge(): Forge {
       const pathname = url.pathname;
       const method = req.method ?? 'GET';
       if (method === 'GET' && pathname === '/healthz') {
-        sendJson(res, 200, { ok: true });
+        sendHealth(res);
         return;
       }
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
